@@ -1,0 +1,22 @@
+# Environment / secrets
+.env
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Raw PDFs and generated data (large files, not tracked in git)
+data/raw/
+data/cleaned/
+
+# IDE
+.cursor/

@@ -63,9 +63,28 @@ Note on `keywords` field: NOT used for retrieval. Used only in evaluation (Phase
 
 ---
 
-## Phase 1 — Ingestion Pipeline (NOT STARTED)
+## Phase 1 — Ingestion Pipeline (IN PROGRESS)
 
-To be filled in: 1.1 extraction, 1.2 chunking, 1.3 enhancement, 1.4 metadata schema, 1.5 embedding model, 1.6 vector store, 1.7 batch strategy, 1.8 validation.
+### 1.1 Document Extraction and Cleaning (COMPLETE)
+
+Design lens for all of Phase 1: even though this project currently indexes a single PDF, every ingestion decision is made as if a folder of many guideline PDFs will be dropped in later. No document-specific hacks (e.g., hardcoded marker strings, one-off table handling) — every step must be a general rule that happens to apply to this document, not a rule written for this document.
+
+| Sub-decision | Choice | Rationale |
+|---|---|---|
+| Extraction library | **pdfplumber** | Gives both text extraction and structural table detection in one library — one consistent extraction path across all future documents rather than per-document tooling choices. |
+| Table handling | **General table-detection step**: run `find_tables()` on every page of every document. Any detected table is pulled out and processed separately from surrounding body text, then linearized into self-contained text (column headers repeated per row so each row stands alone) before being rejoined into the document's text flow at the point it occurred. | Not a "Table 1" special case — this fires on whatever tables exist in whatever document is being ingested. Prevents scrambled row/column extraction (the known risk flagged in 0.2) generally, not just for this table. |
+| Figure/image handling | **General image-detection step**: detect embedded images/figures on each page (via pdfplumber page images or bounding-box crops). Each figure image is sent to a cheap vision-capable LLM (GPT-4o-mini or Claude Haiku tier) with a prompt to describe its content in plain prose — including all text labels and the logical/flow relationships between elements. The description is inserted inline into the extracted text at the point the figure occurred, clearly tagged (e.g., `[Figure 1 description: ...]`). | Manual transcription doesn't scale to many documents; skipping loses real clinically-actionable content (confirmed needed for test-set questions q14, q16). Vision-LLM description is the standard scalable approach and costs a few cents per document at ingestion time (one-time cost, not per-query). |
+| Noise exclusion | **Config-driven section-header exclusion list**, checked against detected section headers during extraction. Any section whose header matches an entry in the list (e.g., `["DISCLOSURE", "REFERENCES", "CONFLICT OF INTEREST", "ACKNOWLEDGMENTS"]`) is dropped from the cleaned output. List lives in a config file, not inline code. | Hardcoding a truncation marker specific to this PDF breaks on the next document with different section names. A config-driven exclusion list means adding a new document type is a config edit, not a code change. |
+
+**Implementation note for Cursor agent:** build this as a pipeline of discrete steps (extract text → detect/linearize tables → detect/describe figures → apply section exclusion list → output cleaned text) so each step is independently testable and reusable across documents. Output of 1.1 lands in `data/cleaned/`, one cleaned text file per source PDF, ready for Phase 1.2 chunking.
+
+### 1.2 Chunking Strategy (NOT STARTED)
+### 1.3 Chunk Enhancement (NOT STARTED)
+### 1.4 Metadata Schema (NOT STARTED)
+### 1.5 Embedding Model (NOT STARTED)
+### 1.6 Vector Store (NOT STARTED)
+### 1.7 Batch Strategy (NOT STARTED)
+### 1.8 Index Validation (NOT STARTED)
 
 ---
 

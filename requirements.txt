@@ -1,0 +1,7 @@
+# Phase 1.1 — Document extraction and cleaning
+pdfplumber==0.11.10    # PDF text extraction + structural table detection
+pymupdf==1.28.0        # PDF page rendering for vision-LLM figure crops
+openai==2.44.0         # Vision LLM (GPT-4o-mini) + future generation calls
+python-dotenv==1.2.2   # .env loading
+pyyaml==6.0.3          # Config file parsing
+Pillow==12.2.0         # Image handling (transitive dep of pdfplumber; pinned for reproducibility)

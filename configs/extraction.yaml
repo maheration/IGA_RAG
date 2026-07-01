@@ -1,0 +1,79 @@
+extraction:
+  # Words whose top-edge y-coordinate (from page top) is below this value are
+  # treated as running headers and stripped from body text.  In this PDF
+  # running headers consistently appear at y ≈ 24–27 pts.
+  running_header_top_pts: 40
+
+  # Sections to drop from the cleaned output (case-insensitive substring match
+  # against detected section headers).  Add new entries here when ingesting
+  # documents with different noise-section names — no code changes required.
+  exclude_sections:
+    - "REFERENCES"
+    - "DISCLOSURE"
+    - "CONFLICT OF INTEREST"
+    - "ACKNOWLEDGMENT"
+    - "SUPPLEMENTARY"
+    - "AUTHOR CONTRIBUTION"
+
+figure_detection:
+  # Expand each detected figure bbox by this many pts in the top and bottom
+  # directions before using it to filter body-text words.  This captures text
+  # labels and captions that pdfplumber places just outside the graphical
+  # bounding box (e.g. flowchart labels above the top curve, figure captions
+  # immediately below the figure bottom).
+  bbox_padding_pts: 25
+
+  # Minimum width AND height (pts) for a rectangle to be considered a figure
+  # box rather than a line, underline, or thin border.
+  min_rect_dimension: 5
+
+  # A cluster must contain at least this many qualifying rectangles to be
+  # classified as a vector figure region.
+  min_rects_in_cluster: 3
+
+  # Two rectangles within this distance (pts) of each other are merged into
+  # the same cluster.  Increase if flowchart boxes are widely spaced.
+  cluster_proximity_pts: 60
+
+  # Cluster bounding-box area must exceed this threshold (pts²) to be treated
+  # as a figure.  Prevents tiny icon clusters from triggering vision calls.
+  min_cluster_area_pts2: 4000
+
+  # Page render resolution multiplier (1.0 = 72 dpi, 2.0 = 144 dpi).
+  # Higher = sharper image sent to vision LLM; lower = smaller payload.
+  render_scale: 2.0
+
+quality_gate:
+  # Hard fail: extracted text shorter than this is almost certainly broken.
+  min_content_chars: 5000
+
+  # Hard fail: fraction of all whitespace-delimited tokens that are long
+  # all-letter strings with no spaces (word-glue detector).
+  word_glue_min_len: 25        # tokens longer than this are suspect
+  word_glue_max_ratio: 0.03    # allow up to 3 % (captures compound terms, etc.)
+
+  # Warning only: fraction of non-empty lines that are very short.
+  # Some short lines are expected (figure captions, page tags, table cells).
+  short_line_max_ratio: 0.25
+
+  # Hard fail: fraction of test-set keywords that must appear in the text.
+  # Set below 1.0 to allow for:
+  #   - Keywords that are paraphrases/summaries rather than exact quotes
+  #     (e.g. "glucocorticoid toxicity" vs "toxicity of systemic glucocorticoids")
+  #   - Minor word-glue in non-critical areas (table cells, figure captions)
+  #   - Hyphenated line-breaks that span word boundaries
+  keyword_coverage_min: 0.75
+
+vision:
+  model: "gpt-4o-mini"
+  max_tokens: 600
+  # Prompt sent to the vision LLM for every detected figure region.
+  # Written to produce dense, retrieval-friendly prose.
+  prompt: >
+    This image is a cropped region from a clinical medical guideline PDF.
+    Describe its content in complete, plain prose so that someone who cannot
+    see the image can fully understand it.
+    Include every text label visible in the image verbatim, the logical and
+    flow relationships between elements (for example: "Box A leads to Box B
+    when condition X is met"), and the overall clinical purpose of the figure.
+    Do not use markdown, bullet points, or headers — write in continuous prose.
