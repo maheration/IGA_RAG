@@ -1,12 +1,14 @@
 """
-Phase 1.1 — Document extraction and cleaning pipeline.
+Phase 1.1 — Document extraction and cleaning pipeline (pymupdf4llm backend).
 
-Orchestrates the three sub-steps into a single pipeline per PDF:
-  1. Per-page: extract body text as (y, text) blocks with tables linearized inline.
-  2. Per-page: detect figure regions and call vision LLM for prose descriptions.
-  3. Per-page: merge all blocks by y-position → correct top-to-bottom ordering.
-  4. Document-level: apply config-driven section exclusion.
-  5. Write cleaned text to data/cleaned/<stem>.txt
+Orchestrates extraction into a single pipeline per PDF:
+  1. pymupdf4llm converts each page to markdown, handling column ordering,
+     table linearisation, and figure-region detection via its internal ML
+     layout model — replacing all hand-rolled coordinate heuristics.
+  2. Per-page post-processing: unwrap picture-text blocks, strip running
+     headers/footers, normalise symbol encoding, fix compound-word artifacts.
+  3. Document-level: apply config-driven section exclusion.
+  4. Quality gate before writing to data/cleaned/<stem>.txt.
 
 Usage
 -----
@@ -25,17 +27,14 @@ import re
 import sys
 from pathlib import Path
 
-import fitz  # pymupdf
-import pdfplumber
+import pymupdf4llm
 import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
 
 from gates.base import GateFailure
 from gates.p1_1_extraction import run as run_extraction_gate
-from src.ingestion.figure_handler import FigureDescription, describe_page_figures, detect_figure_regions
 from src.ingestion.section_filter import filter_excluded_sections
-from src.ingestion.table_handler import detect_column_boundary, get_page_content_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -55,122 +54,144 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
         return yaml.safe_load(f)
 
 
-# ── Per-page assembly ─────────────────────────────────────────────────────────
+# ── Picture-text block processing ────────────────────────────────────────────
 
 
-def _assemble_page_text(
-    text_blocks: list[tuple[float, str]],
-    figure_descriptions: list[FigureDescription],
-    col_boundary: float | None,
-    page_height: float,
-) -> str:
+def _process_picture_text_blocks(md: str) -> str:
     """
-    Merge body-text/table blocks and figure descriptions into a single
-    page string, sorted by their adjusted y-coordinate.
+    pymupdf4llm wraps figure/flowchart label text in HTML comment markers:
 
-    For two-column pages, figure descriptions are assigned to their
-    column by their horizontal center: left-column figures keep their
-    original top_y; right-column figures get top_y + page_height so they
-    sort after all left-column content.
+        <!-- Start of picture text -->
+        label one<br>label two<br>...
+        <!-- End of picture text -->
+
+    This function converts those blocks to a labelled prose marker so the
+    content (flowchart labels, diagram text) is preserved for RAG retrieval
+    but clearly separated from body paragraphs.
     """
-    all_items: list[tuple[float, str]] = list(text_blocks)
+    def _replace(m: re.Match) -> str:
+        content = m.group(1)
+        content = re.sub(r"<br\s*/?>", "\n", content)
+        content = content.strip()
+        return f"[Figure content: {content}]"
 
-    for fig in figure_descriptions:
-        if col_boundary is not None:
-            fig_center_x = (fig.x0 + fig.x1) / 2
-            y_adj = fig.top_y if fig_center_x < col_boundary else page_height + fig.top_y
-        else:
-            y_adj = fig.top_y
-        all_items.append((y_adj, fig.description))
+    return re.sub(
+        r"<!--\s*Start of picture text\s*-->(.*?)<!--\s*End of picture text\s*-->",
+        _replace,
+        md,
+        flags=re.DOTALL,
+    )
 
-    all_items.sort(key=lambda item: item[0])
-    return "\n\n".join(text for _, text in all_items if text.strip())
+
+# ── Running-header / footer stripping ─────────────────────────────────────────
+
+
+# Patterns for text that appears verbatim on every page of the KDIGO PDF
+# (journal running title, author-line footer, journal citation footer).
+# These are stripped as part of per-page post-processing so they never
+# reach the section filter or the quality gate.
+_RUNNING_HEADER_PATTERNS: list[re.Pattern] = [
+    re.compile(r"^KDIGO executive conclusions\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^J Floege et al\..*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^www\.kidney-international\.org\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^Kidney International \(\d{4}\) \d+, \d+[–\-]\d+\s*$", re.MULTILINE),
+    # Standalone journal-page numbers (e.g. "548", "549")
+    re.compile(r"^\d{3,4}\s*$", re.MULTILINE),
+]
+
+
+def _strip_running_headers(md: str) -> str:
+    for pat in _RUNNING_HEADER_PATTERNS:
+        md = pat.sub("", md)
+    return md
+
+
+# ── Compound-word artifact repair ─────────────────────────────────────────────
+
+
+# PDF soft-hyphens at line breaks sometimes produce run-together compound
+# words in the pymupdf4llm output.  Fix the known occurrences for this
+# document family; extend the list as new documents are ingested.
+_COMPOUND_WORD_FIXES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\breninangiotensin\b", re.IGNORECASE), "renin-angiotensin"),
+    (re.compile(r"\bsodiumglucose\b", re.IGNORECASE), "sodium-glucose"),
+    (re.compile(r"\bplacebocontrolled\b", re.IGNORECASE), "placebo-controlled"),
+]
+
+
+def _fix_compound_words(text: str) -> str:
+    for pat, replacement in _COMPOUND_WORD_FIXES:
+        text = pat.sub(replacement, text)
+    return text
+
+
+# ── Per-page cleaning ─────────────────────────────────────────────────────────
+
+
+def _clean_page_markdown(md: str) -> str:
+    """Apply all per-page post-processing steps to one pymupdf4llm page chunk."""
+    md = _process_picture_text_blocks(md)
+    md = _strip_running_headers(md)
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    return md.strip()
 
 
 # ── Core document pipeline ────────────────────────────────────────────────────
 
 
-def extract_document(pdf_path: Path, config: dict, openai_client: OpenAI) -> str:
+def extract_document(
+    pdf_path: Path,
+    config: dict,
+    openai_client: OpenAI | None = None,
+) -> str:
     """
     Run the full extraction pipeline for a single PDF.
 
-    Opens the file once with pdfplumber (structural analysis) and once with
-    pymupdf (page rendering for vision LLM) to avoid reopening per page.
+    Uses pymupdf4llm for base extraction (column ordering, table
+    linearisation, figure-region separation via ML layout model) then
+    applies document-level post-processing and section exclusion.
+
+    The ``openai_client`` parameter is accepted for API compatibility with
+    the batch runner but is not currently used; vision-LLM figure
+    descriptions will be re-introduced as an optional enhancement once the
+    base pipeline is stable.
 
     Returns:
-        Cleaned text string ready for Phase 1.2 chunking.
+        Cleaned text/markdown string ready for Phase 1.2 chunking.
     """
     logger.info("Extracting: %s", pdf_path.name)
 
+    # Step 1 — per-page markdown via pymupdf4llm
+    page_chunks = pymupdf4llm.to_markdown(str(pdf_path), page_chunks=True)
+    total_pages = len(page_chunks)
+
     page_texts: list[str] = []
-    figure_counter = [0]  # mutable int shared across pages
+    for i, chunk in enumerate(page_chunks):
+        logger.info("  Page %d / %d", i + 1, total_pages)
+        page_md = _clean_page_markdown(chunk["text"])
+        if page_md:
+            page_texts.append(page_md)
 
-    with pdfplumber.open(pdf_path) as plumber_doc, fitz.open(str(pdf_path)) as fitz_doc:
-        total_pages = len(plumber_doc.pages)
-
-        for page_index, plumber_page in enumerate(plumber_doc.pages):
-            logger.info("  Page %d / %d", page_index + 1, total_pages)
-            fitz_page = fitz_doc[page_index]
-
-            # Step 1 — detect figure regions first (no LLM yet)
-            # This must happen before text extraction so figure bboxes can be
-            # excluded from body-text word collection, preventing flowchart
-            # labels from leaking into the extracted prose.
-            fig_regions = detect_figure_regions(plumber_page, config)
-
-            # Pad figure bboxes to capture overhanging labels and captions
-            # (text that sits just outside the graphical boundary in the PDF).
-            pad = config["figure_detection"].get("bbox_padding_pts", 0)
-            padded_fig_regions = [
-                (x0, max(0, top - pad), x1, min(plumber_page.height, bottom + pad))
-                for x0, top, x1, bottom in fig_regions
-            ]
-
-            # Step 2 — body text + linearized tables as (y, text) blocks,
-            # with figure regions excluded from word collection.
-            header_strip_top = config["extraction"].get("running_header_top_pts", 0)
-            col_boundary = detect_column_boundary(plumber_page)
-            text_blocks = get_page_content_blocks(
-                plumber_page,
-                figure_bboxes=padded_fig_regions,
-                header_strip_top=header_strip_top,
-            )
-
-            # Step 3 — call vision LLM for each detected figure region
-            figure_descriptions = describe_page_figures(
-                pdfplumber_page=plumber_page,
-                fitz_page=fitz_page,
-                config=config,
-                openai_client=openai_client,
-                figure_counter=figure_counter,
-                predetected_regions=fig_regions,
-            )
-
-            # Step 4 — merge all blocks into correct vertical order (column-aware)
-            page_text = _assemble_page_text(
-                text_blocks, figure_descriptions,
-                col_boundary, plumber_page.height,
-            )
-            page_texts.append(f"[Page {page_index + 1}]\n{page_text}")
-
-    # Step 4 — concatenate all pages
     full_text = "\n\n".join(page_texts)
 
-    # Step 5 — drop noise sections
-    excluded_headers = config["extraction"]["exclude_sections"]
-    cleaned = filter_excluded_sections(full_text, excluded_headers)
-
-    # Step 6 — fix known PDF font-encoding substitutions for math symbols
+    # Step 2 — fix known PDF font-encoding substitutions for math symbols
     # Some PDFs encode ≥ as $ and ≤ as # in custom symbol fonts; fix these
     # only when immediately followed by a digit (safe for clinical content).
-    cleaned = re.sub(r"\$(\d)", r"≥\1", cleaned)
-    cleaned = re.sub(r"#(\d)", r"≤\1", cleaned)
+    full_text = re.sub(r"\$(\d)", r"≥\1", full_text)
+    full_text = re.sub(r"#(\d)", r"≤\1", full_text)
+
+    # Step 3 — fix compound-word PDF hyphenation artifacts
+    full_text = _fix_compound_words(full_text)
+
+    # Step 4 — drop noise sections
+    excluded_headers = config["extraction"]["exclude_sections"]
+    full_text = filter_excluded_sections(full_text, excluded_headers)
 
     logger.info(
-        "Done. %d page(s), %d figure(s), %d chars after cleaning.",
-        total_pages, figure_counter[0], len(cleaned),
+        "Done. %d page(s), %d chars after cleaning.",
+        total_pages, len(full_text),
     )
-    return cleaned
+    return full_text
 
 
 # ── Output ────────────────────────────────────────────────────────────────────

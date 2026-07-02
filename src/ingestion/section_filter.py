@@ -66,26 +66,30 @@ def filter_excluded_sections(text: str, exclude_headers: list[str]) -> str:
             prev_was_blank = True
             continue
 
-        upper = stripped.upper()
+        # Strip markdown heading markers (e.g. "#### DISCLOSURE" → "DISCLOSURE")
+        # so that header detection works regardless of whether the source is
+        # plain text or markdown produced by pymupdf4llm.
+        heading_stripped = stripped.lstrip("#").strip() if stripped.startswith("#") else stripped
+        upper = heading_stripped.upper()
 
         # — Tier 1: strict header (ALL CAPS letters + spaces only, ≤ 40 chars) —
         # Triggers exclusion regardless of whether a blank line preceded.
-        if _is_strict_header(stripped):
+        if _is_strict_header(heading_stripped):
             if any(exc in upper for exc in normalized_excludes):
                 if not excluding:
-                    logger.debug("Excluding section (strict match): %r", stripped)
+                    logger.debug("Excluding section (strict match): %r", heading_stripped)
                 excluding = True
                 prev_was_blank = False
                 continue
 
         # — Tier 2: lenient header (after blank line, ≤ 80 chars, all-caps or title) —
         # Cancels exclusion when a new non-excluded section begins.
-        if prev_was_blank and _is_lenient_header(stripped):
+        if prev_was_blank and _is_lenient_header(heading_stripped):
             if not any(exc in upper for exc in normalized_excludes):
                 excluding = False  # new, non-excluded section → resume inclusion
             else:
                 excluding = True  # excluded section header after blank line
-                logger.debug("Excluding section (lenient match): %r", stripped)
+                logger.debug("Excluding section (lenient match): %r", heading_stripped)
                 prev_was_blank = False
                 continue
 
@@ -114,15 +118,17 @@ def _is_strict_header(line: str) -> bool:
 def _is_lenient_header(line: str) -> bool:
     """
     Lenient header (requires a preceding blank line from the caller):
-    ≤ 80 characters, not purely numeric, no bracket markup (e.g. [Page N]
-    tags must not reset the excluding state), and either ALL CAPS or Title
-    Cased without a terminal period.
+    ≤ 80 characters, not purely numeric, no bracket markup, and either ALL
+    CAPS or Title Cased without a terminal period.
+
+    ``line`` has already had any leading markdown ``#`` markers stripped by
+    the caller so this function works for both plain-text and markdown input.
     """
     if len(line) > 80:
         return False
     if line.isdigit():
         return False
-    if "[" in line or "]" in line:  # exclude [Page N] tags and similar markup
+    if "[" in line or "]" in line:
         return False
     if line.isupper():
         return True

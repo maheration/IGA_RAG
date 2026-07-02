@@ -1,0 +1,7 @@
+# .gitignore contents
+.env
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+data/raw/        # optional — PDFs can be large, may not want in git

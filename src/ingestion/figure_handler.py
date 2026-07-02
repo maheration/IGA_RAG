@@ -3,6 +3,13 @@ Figure detection and vision-LLM description for PDF pages.
 
 Public API
 ----------
+detect_figure_regions(pdfplumber_page, config) -> list[Bbox]
+    Returns raw graphical bboxes for figure regions.
+
+find_figure_title_bboxes(fitz_page, figure_bboxes) -> list[Bbox]
+    Returns full-page-width exclusion bboxes for text lines that begin with
+    "Figure N |", preventing figure titles from leaking into body text.
+
 describe_page_figures(pdfplumber_page, fitz_page, config, openai_client, figure_counter)
     -> list[FigureDescription]
 
@@ -19,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from dataclasses import dataclass
 
 import fitz  # pymupdf
@@ -26,6 +34,9 @@ import pdfplumber
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
+
+# Matches lines that start a figure title: "Figure 1 |", "Figure 12 |", etc.
+_FIGURE_TITLE_RE = re.compile(r"^figure\s+\d+\s*\|", re.IGNORECASE)
 
 
 @dataclass
@@ -50,6 +61,79 @@ def detect_figure_regions(
     is called (e.g. to exclude figure areas from body-text extraction).
     """
     return _detect_figure_regions(page, config["figure_detection"])
+
+
+def find_figure_title_bboxes(
+    fitz_page: fitz.Page,
+    figure_bboxes: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, float, float]]:
+    """
+    Return full-page-width exclusion bboxes for text lines that begin with
+    the pattern "Figure N |" (case-insensitive).
+
+    Motivation
+    ----------
+    Figure title lines (e.g. "Figure 1 | Initial assessment…") are typically
+    typeset at full page width, while the graphical figure region occupies only
+    a sub-column horizontal range.  The standard word-level exclusion check
+    (wx0 < ex1 and wx1 > ex0) therefore misses words that sit to the left of
+    the figure bbox's left edge, leaving orphaned title fragments in body text.
+
+    This function resolves the x-range mismatch surgically: it identifies only
+    the specific lines that open with a figure label and returns bboxes that
+    span the full page width (x0=0, x1=page_width), covering exactly the
+    vertical extent of those lines and nothing more.
+
+    Algorithm
+    ---------
+    1. Collect all words via get_text("words") → (x0, y0, x1, y1, word, …).
+    2. Cluster words into lines: words whose y0 values differ by ≤ 4 pts are
+       on the same line.  Lines are sorted left-to-right by x0.
+    3. For each line, join words and test against _FIGURE_TITLE_RE.
+    4. For matching lines, emit (0.0, line_top, page_width, line_bottom).
+    """
+    if not figure_bboxes:
+        return []
+
+    page_rect = fitz_page.rect
+    page_width = page_rect.width
+
+    # fitz "words" tuple: (x0, y0, x1, y1, word, block_no, line_no, word_no)
+    words = fitz_page.get_text("words")
+    if not words:
+        return []
+
+    # Cluster words into lines by y0 proximity (≤ 4 pts → same line).
+    _Y_TOL = 4.0
+    lines: list[list[tuple[float, float, float, float, str]]] = []
+    for w in words:
+        wx0, wy0, wx1, wy1 = float(w[0]), float(w[1]), float(w[2]), float(w[3])
+        word_text = str(w[4])
+        placed = False
+        for line in lines:
+            rep_y0 = line[0][1]
+            if abs(wy0 - rep_y0) <= _Y_TOL:
+                line.append((wx0, wy0, wx1, wy1, word_text))
+                placed = True
+                break
+        if not placed:
+            lines.append([(wx0, wy0, wx1, wy1, word_text)])
+
+    result: list[tuple[float, float, float, float]] = []
+    for line in lines:
+        # Sort left-to-right and reconstruct the line text.
+        line.sort(key=lambda w: w[0])
+        line_text = " ".join(w[4] for w in line)
+        if not _FIGURE_TITLE_RE.match(line_text):
+            continue
+
+        line_top    = min(w[1] for w in line)
+        line_bottom = max(w[3] for w in line)
+        result.append((0.0, line_top, page_width, line_bottom))
+        logger.debug("Excluding figure title line y=[%.1f, %.1f]: %s",
+                     line_top, line_bottom, line_text[:60])
+
+    return result
 
 
 def describe_page_figures(
